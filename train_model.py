@@ -293,31 +293,27 @@ def train_one(df, cfg, asset_key):
 #  التشغيل الرئيسي
 # ================================================================
 def load_csv(path):
-    # 1. قراءة الملف بشكل طبيعي
-    df = pd.read_csv(path)
+    # قراءة الملف مع تخطي السطر الأول، وتسمية الأعمدة بنفسنا
+    # هذه الأسماء تتطابق مع ترتيب أعمدة الميتاتريدر الافتراضي (تاريخ، وقت، فتح، أعلى، أدنى، إغلاق، فوليوم)
+    df = pd.read_csv(
+        path, 
+        skiprows=1,  # تجاهل السطر الأول الذي يسبب المشاكل
+        names=['date', 'time', 'open', 'high', 'low', 'close', 'tickvol', 'vol', 'spread'] 
+    )
     
-    # 2. تنظيف أسماء الأعمدة (تحويل لحروف صغيرة وإزالة أقواس الميتاتريدر < >)
-    df.columns = df.columns.str.lower().str.replace('<', '').str.replace('>', '')
+    # استخدام أول 7 أعمدة فقط تحسباً لوجود أعمدة إضافية فارغة
+    df = df.iloc[:, :7]
+    df.columns = ['date', 'time', 'open', 'high', 'low', 'close', 'tickvol']
     
-    # 3. معالجة التاريخ والوقت بذكاء
-    if 'date' in df.columns and 'time' in df.columns:
-        # دمج عمود التاريخ مع عمود الوقت (صيغة الميتاتريدر المعتادة)
-        df['time'] = pd.to_datetime(df['date'].astype(str) + ' ' + df['time'].astype(str))
-        df.drop(columns=['date'], inplace=True)
-    elif 'date' in df.columns and 'time' not in df.columns:
-        # إذا كان هناك عمود تاريخ فقط
-        df.rename(columns={'date': 'time'}, inplace=True)
-        df['time'] = pd.to_datetime(df['time'])
-    else:
-        # إذا كان العمود اسمه time وجاهزاً
-        df['time'] = pd.to_datetime(df['time'])
+    # دمج التاريخ والوقت بذكاء
+    df['time'] = pd.to_datetime(df['date'].astype(str) + ' ' + df['time'].astype(str))
+    df.drop(columns=['date'], inplace=True)
 
-    # 4. الترتيب وإعادة الضبط (هذا الجزء الذي كان ناقصاً)
+    # الترتيب وإعادة الضبط
     df.sort_values('time', inplace=True)
     df.reset_index(drop=True, inplace=True)
     print(f"  ✅ {path}: {len(df):,} شمعة")
     
-    # 5. إرجاع البيانات للكود الرئيسي (الأهم!)
     return df
    
 if __name__ == "__main__":
