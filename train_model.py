@@ -26,9 +26,8 @@ import os
 
 RANDOM_SEED = 42
 N_SAMPLES   = 50_000
-MODELS_DIR  = os.path.join(os.path.dirname(__file__), "..", "models")
+MODELS_DIR = "models"
 os.makedirs(MODELS_DIR, exist_ok=True)
-
 np.random.seed(RANDOM_SEED)
 
 # ─────────────────────────────────────────────
