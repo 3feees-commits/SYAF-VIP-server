@@ -1,390 +1,298 @@
 """
-ARIA XGBoost Prediction Server v3.0
-====================================
-خادم FastAPI للتنبؤ بـ SL/TP لروبوت MT4/MT5
-
-Endpoints:
-  GET  /health          — فحص صحة الخادم
-  GET  /info            — معلومات النموذج والإحصائيات
-  POST /predict         — التنبؤ بـ SL/TP (الاستخدام الرئيسي)
-  POST /predict/batch   — تنبؤات متعددة دفعة واحدة
-  GET  /features        — قائمة المميزات المطلوبة
+==============================================================
+  ARIA SYAF Adaptive XGBoost Server v3.0
+  خادم ذكي يكتشف نوع الزوج تلقائياً ويختار النموذج المناسب
+==============================================================
+  /predict  ← يستقبل JSON من MT4 ويعيد SL/TP/Direction
+  /health   ← فحص حالة الخادم والنماذج المحمّلة
+  /models   ← قائمة النماذج المتاحة
+==============================================================
 """
 
-import os
-import json
-import time
-import logging
-from contextlib import asynccontextmanager
-from typing import Optional
-
+from flask import Flask, request, jsonify
 import numpy as np
-import xgboost as xgb
-from fastapi import FastAPI, HTTPException, Request
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
-from pydantic import BaseModel, Field, field_validator
+import joblib
+import os
+import re
+import logging
+import math
+import time
 
-# ─────────────────────────────────────────────
-# إعداد السجلات
-# ─────────────────────────────────────────────
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
-    datefmt="%Y-%m-%d %H:%M:%S",
-)
-logger = logging.getLogger("aria-xgboost")
+logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(message)s')
+logger = logging.getLogger(__name__)
 
-# ─────────────────────────────────────────────
-# مسارات النماذج
-# ─────────────────────────────────────────────
-BASE_DIR   = os.path.dirname(os.path.abspath(__file__))
-MODELS_DIR = os.path.join(BASE_DIR, "models")
+app = Flask(__name__)
 
-# ─────────────────────────────────────────────
-# متغيرات عامة للنماذج
-# ─────────────────────────────────────────────
-model_sl: Optional[xgb.XGBRegressor] = None
-model_tp: Optional[xgb.XGBRegressor] = None
-model_meta: dict = {}
-request_count: int = 0
-start_time: float = time.time()
+# ================================================================
+#  تحميل النماذج عند بدء الخادم
+# ================================================================
+MODELS = {}          # {"btc": pkg, "gold": pkg, "forex": pkg}
+MODELS_DIR = os.environ.get("MODELS_DIR", "models")
 
-FEATURE_COLS = [
-    "fast_ema", "slow_ema", "ema_diff", "adx", "di_plus", "di_minus",
-    "atr", "rsi", "close1", "close2", "close3", "spread", "direction",
-    "volatility_ratio", "trend_strength", "momentum"
-]
+def load_all_models():
+    for key in ["btc", "gold", "forex"]:
+        path = os.path.join(MODELS_DIR, f"{key}_model.pkl")
+        if os.path.exists(path):
+            try:
+                MODELS[key] = joblib.load(path)
+                cfg = MODELS[key].get('config', {})
+                logger.info(f"✅ نموذج {key} محمّل — {cfg.get('name','?')} | {len(MODELS[key]['feature_columns'])} ميزة")
+            except Exception as e:
+                logger.error(f"❌ فشل تحميل نموذج {key}: {e}")
+        else:
+            logger.warning(f"⚠️  نموذج {key} غير موجود: {path}")
+
+load_all_models()
 
 
-# ─────────────────────────────────────────────
-# تحميل النماذج عند بدء الخادم
-# ─────────────────────────────────────────────
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    global model_sl, model_tp, model_meta
-    logger.info("=" * 50)
-    logger.info("ARIA XGBoost Server — بدء التشغيل")
+# ================================================================
+#  اكتشاف نوع الزوج تلقائياً
+# ================================================================
+BTC_SYMBOLS  = {'BTCUSD','BTCUSDT','XBTUSD','BTC','BTCEUR','BTCGBP','ETHUSD','ETHUSDT','ETH'}
+GOLD_SYMBOLS = {'XAUUSD','GOLD','XAUEUR','XAUGBP','XAUJPY','XAUAUD','XAUCHF'}
+FOREX_PREFIXES = {'EUR','GBP','USD','JPY','AUD','NZD','CAD','CHF','SGD','HKD','NOK','SEK','DKK','MXN','ZAR','TRY'}
 
-    sl_path   = os.path.join(MODELS_DIR, "sl_model.json")
-    tp_path   = os.path.join(MODELS_DIR, "tp_model.json")
-    meta_path = os.path.join(MODELS_DIR, "model_meta.json")
-
-    if not os.path.exists(sl_path) or not os.path.exists(tp_path):
-        logger.error("النماذج غير موجودة! شغّل train_model.py أولاً.")
-        raise RuntimeError("Models not found. Run train_model.py first.")
-
-    model_sl = xgb.XGBRegressor()
-    model_sl.load_model(sl_path)
-
-    model_tp = xgb.XGBRegressor()
-    model_tp.load_model(tp_path)
-
-    if os.path.exists(meta_path):
-        with open(meta_path) as f:
-            model_meta = json.load(f)
-
-    logger.info(f"✅ SL Model loaded — MAE={model_meta.get('sl_model', {}).get('mae_pips', '?')} pips")
-    logger.info(f"✅ TP Model loaded — MAE={model_meta.get('tp_model', {}).get('mae_pips', '?')} pips")
-    logger.info("=" * 50)
-    yield
-    logger.info("ARIA XGBoost Server — إيقاف التشغيل")
-
-
-# ─────────────────────────────────────────────
-# إنشاء التطبيق
-# ─────────────────────────────────────────────
-app = FastAPI(
-    title="ARIA XGBoost Prediction Server",
-    description="خادم التنبؤ بـ SL/TP لروبوت التداول ARIA",
-    version="3.0.0",
-    lifespan=lifespan,
-)
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_methods=["GET", "POST"],
-    allow_headers=["*"],
-)
-
-
-# ─────────────────────────────────────────────
-# نماذج البيانات (Pydantic)
-# ─────────────────────────────────────────────
-class PredictRequest(BaseModel):
-    # مؤشرات EMA
-    fast_ema: float = Field(..., description="Fast EMA value")
-    slow_ema: float = Field(..., description="Slow EMA value")
-
-    # مؤشر ADX
-    adx: float      = Field(..., ge=0, le=100, description="ADX value (0-100)")
-    di_plus: float  = Field(..., ge=0, le=100, description="DI+ value")
-    di_minus: float = Field(..., ge=0, le=100, description="DI- value")
-
-    # ATR و RSI
-    atr: float = Field(..., gt=0, description="ATR value")
-    rsi: float = Field(..., ge=0, le=100, description="RSI value (0-100)")
-
-    # أسعار الإغلاق
-    close1: float = Field(..., gt=0, description="Close[1] — last closed bar")
-    close2: float = Field(..., gt=0, description="Close[2]")
-    close3: float = Field(..., gt=0, description="Close[3]")
-
-    # معلومات إضافية
-    spread: float    = Field(default=1.0, ge=0, description="Current spread in pips")
-    direction: float = Field(..., description="Trade direction: 1=BUY, -1=SELL")
-
-    # حقول اختيارية (يحسبها الخادم إذا لم تُرسَل)
-    volatility_ratio: Optional[float] = Field(default=None)
-    trend_strength:   Optional[float] = Field(default=None)
-    momentum:         Optional[float] = Field(default=None)
-
-    @field_validator("direction")
-    @classmethod
-    def validate_direction(cls, v):
-        if v not in (1, -1, 1.0, -1.0):
-            raise ValueError("direction must be 1 (BUY) or -1 (SELL)")
-        return float(v)
-
-
-class PredictResponse(BaseModel):
-    sl_pips:    float
-    tp_pips:    float
-    confidence: float
-    rr_ratio:   float
-    message:    str
-
-
-class BatchRequest(BaseModel):
-    items: list[PredictRequest]
-
-
-class BatchResponse(BaseModel):
-    results: list[PredictResponse]
-    count:   int
-
-
-# ─────────────────────────────────────────────
-# دالة مساعدة: بناء مصفوفة المميزات
-# ─────────────────────────────────────────────
-def build_features(req: PredictRequest) -> np.ndarray:
-    ema_diff = req.fast_ema - req.slow_ema
-
-    volatility_ratio = req.volatility_ratio
-    if volatility_ratio is None:
-        volatility_ratio = req.atr / (req.close1 + 1e-10)
-
-    trend_strength = req.trend_strength
-    if trend_strength is None:
-        trend_strength = abs(ema_diff) / (req.atr + 1e-10)
-
-    momentum = req.momentum
-    if momentum is None:
-        momentum = req.close1 - req.close3
-
-    features = np.array([[
-        req.fast_ema,
-        req.slow_ema,
-        ema_diff,
-        req.adx,
-        req.di_plus,
-        req.di_minus,
-        req.atr,
-        req.rsi,
-        req.close1,
-        req.close2,
-        req.close3,
-        req.spread,
-        req.direction,
-        volatility_ratio,
-        trend_strength,
-        momentum,
-    ]], dtype=np.float32)
-
-    return features
-
-
-def compute_confidence(sl_pips: float, tp_pips: float, adx: float, rsi: float) -> float:
+def detect_asset_class(symbol: str) -> str:
     """
-    يحسب مستوى الثقة (0.0–1.0) بناءً على:
-    - قوة الاتجاه (ADX)
-    - موقع RSI
-    - نسبة Risk/Reward
+    يكتشف فئة الأصل من اسم الزوج:
+      - btc   : BTCUSD, ETHUSD, BTCUSDT, ...
+      - gold  : XAUUSD, GOLD, ...
+      - forex : EURUSD, GBPJPY, USDJPY, ...
     """
-    # عامل ADX: كلما كان أعلى كانت الثقة أعلى
-    adx_factor = min(adx / 60.0, 1.0)  # ADX=60 → factor=1.0
+    s = symbol.upper().replace("/","").replace("-","").replace("_","").replace(".","")
+    # إزالة اللاحقات الشائعة
+    for suffix in ['PRO','MICRO','MINI','ECN','STP','RAW','CASH','SPOT']:
+        s = s.replace(suffix, '')
 
-    # عامل RSI: أفضل ثقة عند 40-60 (منطقة محايدة)
-    rsi_dist   = abs(rsi - 50) / 50.0  # 0=محايد، 1=متطرف
-    rsi_factor = 1.0 - rsi_dist * 0.3
+    if s in BTC_SYMBOLS or s.startswith('BTC') or s.startswith('ETH') or \
+       any(x in s for x in ['BTC','ETH','XRP','LTC','ADA','SOL','DOT','DOGE','MATIC','LINK']):
+        return 'btc'
 
-    # عامل RR: نسبة أعلى = ثقة أعلى (حتى حد معين)
-    rr = tp_pips / (sl_pips + 1e-10)
-    rr_factor = min(rr / 3.0, 1.0)
+    if s in GOLD_SYMBOLS or s.startswith('XAU') or 'GOLD' in s:
+        return 'gold'
 
-    confidence = (adx_factor * 0.5 + rsi_factor * 0.2 + rr_factor * 0.3)
-    return round(float(np.clip(confidence, 0.30, 0.95)), 4)
+    # فوركس: زوجان من العملات الرئيسية
+    base = s[:3]
+    quote = s[3:6] if len(s) >= 6 else ''
+    if base in FOREX_PREFIXES or quote in FOREX_PREFIXES:
+        return 'forex'
 
-
-# ─────────────────────────────────────────────
-# Middleware: تسجيل الطلبات
-# ─────────────────────────────────────────────
-@app.middleware("http")
-async def log_requests(request: Request, call_next):
-    global request_count
-    request_count += 1
-    t0 = time.time()
-    response = await call_next(request)
-    elapsed = (time.time() - t0) * 1000
-    logger.info(f"{request.method} {request.url.path} → {response.status_code} ({elapsed:.1f}ms)")
-    return response
+    # افتراضي: فوركس
+    logger.warning(f"⚠️  لم يُتعرَّف على الزوج '{symbol}' — استخدام نموذج forex")
+    return 'forex'
 
 
-# ─────────────────────────────────────────────
-# Endpoints
-# ─────────────────────────────────────────────
+# ================================================================
+#  بناء متجه الميزات من بيانات MT4
+# ================================================================
+def build_feature_vector(data: dict, asset_key: str) -> np.ndarray:
+    d = data
+    asset_map = {"forex": 0.0, "gold": 0.5, "btc": 1.0}
 
-@app.get("/health", tags=["System"])
-async def health():
-    """فحص صحة الخادم — يُستخدم من MT4 للتحقق من الاتصال."""
-    return {
-        "status":    "ok",
-        "models":    "loaded" if model_sl and model_tp else "not_loaded",
-        "uptime_s":  round(time.time() - start_time, 1),
-        "requests":  request_count,
-        "version":   "3.0.0",
+    fast_ema = float(d.get('fast_ema', 0))
+    slow_ema = float(d.get('slow_ema', 0))
+    ema200   = float(d.get('ema200', 0))
+    close    = float(d.get('close1', fast_ema or 1))
+    atr14    = float(d.get('atr14', 1)) or 1
+    atr7     = float(d.get('atr7', atr14))
+    atr21    = float(d.get('atr21', atr14))
+
+    ema_cross        = float(np.sign(fast_ema - slow_ema))
+    price_vs_ema200  = (close - ema200) / (ema200 + 1e-10) if ema200 > 0 else 0
+    price_vs_fast    = (close - fast_ema) / (fast_ema + 1e-10) if fast_ema > 0 else 0
+    atr_ratio        = atr7 / (atr21 + 1e-10)
+
+    adx      = float(d.get('adx', 0))
+    di_plus  = float(d.get('di_plus', 0))
+    di_minus = float(d.get('di_minus', 0))
+    cfg      = MODELS.get(asset_key, {}).get('config', {})
+    adx_thresh = cfg.get('adx_threshold', 22)
+    adx_above  = 1.0 if adx > adx_thresh else 0.0
+
+    rsi14 = float(d.get('rsi14', 50))
+    rsi7  = float(d.get('rsi7', 50))
+    rsi_ob = 1.0 if rsi14 > 70 else 0.0
+    rsi_os = 1.0 if rsi14 < 30 else 0.0
+
+    macd_main    = float(d.get('macd_main', 0))
+    macd_sig     = float(d.get('macd_signal', 0))
+    macd_hist    = macd_main - macd_sig
+    macd_cross   = float(np.sign(macd_main - macd_sig))
+
+    stoch_k    = float(d.get('stoch_k', 50))
+    stoch_d    = float(d.get('stoch_d', 50))
+    stoch_cross = float(np.sign(stoch_k - stoch_d))
+
+    bb_width      = float(d.get('bb_width', 0))
+    bb_width_norm = bb_width / (close + 1e-10)
+    bb_position   = float(d.get('bb_position', 0.5))
+    bb_squeeze    = float(d.get('bb_squeeze', 0))
+
+    candle_body       = float(d.get('candle_body', 0))
+    candle_upper_wick = float(d.get('candle_upper_wick', 0))
+    candle_lower_wick = float(d.get('candle_lower_wick', 0))
+    candle_dir        = float(d.get('candle_direction', 0))
+    chg1 = float(d.get('close_change1', 0))
+    chg2 = float(d.get('close_change2', 0))
+    chg3 = float(d.get('close_change3', 0))
+    trend_3 = (np.sign(chg1) + np.sign(chg2) + np.sign(chg3)) / 3.0
+
+    price_in_range = float(d.get('price_in_range', 0.5))
+
+    hour_sin = float(d.get('hour_sin', 0))
+    hour_cos = float(d.get('hour_cos', 1))
+    dow_sin  = float(d.get('dow_sin', 0))
+    dow_cos  = float(d.get('dow_cos', 1))
+
+    asset_class = asset_map.get(asset_key, 0.0)
+
+    return np.array([
+        fast_ema, slow_ema, ema200, ema_cross, price_vs_ema200, price_vs_fast,
+        adx, di_plus, di_minus, adx_above,
+        atr14, atr7, atr21, atr_ratio,
+        rsi14, rsi7, rsi_ob, rsi_os,
+        macd_main, macd_sig, macd_hist, macd_cross,
+        stoch_k, stoch_d, stoch_cross,
+        bb_width, bb_width_norm, bb_position, bb_squeeze,
+        candle_body, candle_upper_wick, candle_lower_wick, candle_dir,
+        chg1, chg2, chg3, trend_3,
+        price_in_range,
+        hour_sin, hour_cos, dow_sin, dow_cos,
+        asset_class,
+    ], dtype=np.float32).reshape(1, -1)
+
+
+# ================================================================
+#  نقطة النهاية الرئيسية: /predict
+# ================================================================
+@app.route('/predict', methods=['POST'])
+def predict():
+    """
+    يستقبل JSON من MT4 ويعيد:
+    {
+      "sl_pips": 120.5,
+      "tp_pips": 301.2,
+      "confidence": 0.78,
+      "direction": "BUY",
+      "signal_strength": "STRONG",
+      "asset_class": "btc",
+      "model_used": "BTC/Crypto"
     }
-
-
-@app.get("/info", tags=["System"])
-async def info():
-    """معلومات النموذج والإحصائيات التفصيلية."""
-    return {
-        "server":    "ARIA XGBoost Prediction Server",
-        "version":   "3.0.0",
-        "model_meta": model_meta,
-        "features":  FEATURE_COLS,
-        "uptime_s":  round(time.time() - start_time, 1),
-        "requests":  request_count,
-    }
-
-
-@app.get("/features", tags=["Model"])
-async def features():
-    """قائمة المميزات المطلوبة مع وصفها."""
-    return {
-        "required_features": [
-            {"name": "fast_ema",   "type": "float", "desc": "Fast EMA (e.g. 8-period)"},
-            {"name": "slow_ema",   "type": "float", "desc": "Slow EMA (e.g. 21-period)"},
-            {"name": "adx",        "type": "float", "desc": "ADX indicator (0-100)"},
-            {"name": "di_plus",    "type": "float", "desc": "DI+ indicator"},
-            {"name": "di_minus",   "type": "float", "desc": "DI- indicator"},
-            {"name": "atr",        "type": "float", "desc": "ATR value (price units)"},
-            {"name": "rsi",        "type": "float", "desc": "RSI (0-100)"},
-            {"name": "close1",     "type": "float", "desc": "Close[1] last closed bar"},
-            {"name": "close2",     "type": "float", "desc": "Close[2]"},
-            {"name": "close3",     "type": "float", "desc": "Close[3]"},
-            {"name": "direction",  "type": "float", "desc": "1=BUY, -1=SELL"},
-        ],
-        "optional_features": [
-            {"name": "spread",           "default": 1.0,  "desc": "Spread in pips"},
-            {"name": "volatility_ratio", "default": "auto", "desc": "ATR/price ratio"},
-            {"name": "trend_strength",   "default": "auto", "desc": "|ema_diff|/ATR"},
-            {"name": "momentum",         "default": "auto", "desc": "close1-close3"},
-        ]
-    }
-
-
-@app.post("/predict", response_model=PredictResponse, tags=["Prediction"])
-async def predict(req: PredictRequest):
     """
-    التنبؤ بـ SL/TP — الـ endpoint الرئيسي المستخدم من MT4.
-
-    يُرجع:
-    - sl_pips: وقف الخسارة المثلى بالنقاط
-    - tp_pips: جني الأرباح المثلى بالنقاط
-    - confidence: مستوى الثقة (0.0–1.0)
-    - rr_ratio: نسبة المخاطرة/المكافأة
-    """
-    if model_sl is None or model_tp is None:
-        raise HTTPException(status_code=503, detail="Models not loaded")
-
     try:
-        X = build_features(req)
+        data = request.get_json(force=True)
+        if not data:
+            return jsonify({"error": "لا توجد بيانات JSON"}), 400
 
-        sl_raw = float(model_sl.predict(X)[0])
-        tp_raw = float(model_tp.predict(X)[0])
+        # ── اكتشاف نوع الزوج تلقائياً ──
+        symbol     = data.get('symbol', data.get('pair', 'EURUSD'))
+        asset_key  = detect_asset_class(symbol)
 
-        # تقييد النتائج في نطاق معقول
-        sl_pips = round(float(np.clip(sl_raw, 5.0, 150.0)), 2)
-        tp_pips = round(float(np.clip(tp_raw, 10.0, 300.0)), 2)
+        logger.info(f"📥 {symbol} → فئة: {asset_key} | ADX={data.get('adx','?')} | dir={data.get('direction','?')}")
 
-        # ضمان أن TP > SL دائماً
-        if tp_pips <= sl_pips:
-            tp_pips = round(sl_pips * 1.5, 2)
+        # ── التحقق من وجود النموذج ──
+        if asset_key not in MODELS:
+            # fallback: استخدم أي نموذج متاح
+            if MODELS:
+                asset_key = list(MODELS.keys())[0]
+                logger.warning(f"⚠️  استخدام نموذج بديل: {asset_key}")
+            else:
+                return jsonify({"error": "لا توجد نماذج محمّلة — شغّل train_multi_model.py أولاً"}), 503
 
-        rr_ratio   = round(tp_pips / sl_pips, 3)
-        confidence = compute_confidence(sl_pips, tp_pips, req.adx, req.rsi)
+        pkg       = MODELS[asset_key]
+        model_dir = pkg['model_dir']
+        model_sl  = pkg['model_sl']
+        model_tp  = pkg['model_tp']
+        cfg       = pkg.get('config', {})
 
-        direction_str = "BUY" if req.direction > 0 else "SELL"
-        message = (
-            f"{direction_str}: SL={sl_pips}p TP={tp_pips}p "
-            f"RR={rr_ratio:.2f} Conf={confidence:.0%}"
-        )
+        # ── بناء متجه الميزات ──
+        X = build_feature_vector(data, asset_key)
 
-        return PredictResponse(
-            sl_pips=sl_pips,
-            tp_pips=tp_pips,
-            confidence=confidence,
-            rr_ratio=rr_ratio,
-            message=message,
-        )
+        # ── التنبؤ ──
+        proba      = model_dir.predict_proba(X)[0]   # [SELL, NEUTRAL, BUY]
+        pred_class = int(model_dir.predict(X)[0]) - 1  # -1, 0, +1
+        direction_map   = {-1: "SELL", 0: "NEUTRAL", 1: "BUY"}
+        confidence_map  = {-1: proba[0], 0: proba[1], 1: proba[2]}
+        confidence = float(confidence_map[pred_class])
+
+        sl_pips = float(model_sl.predict(X)[0])
+        tp_pips = float(model_tp.predict(X)[0])
+
+        # ضمان قيم منطقية حسب فئة الأصل
+        sl_min = {"btc": 20.0, "gold": 5.0, "forex": 5.0}.get(asset_key, 5.0)
+        sl_max = {"btc": 800.0, "gold": 200.0, "forex": 100.0}.get(asset_key, 200.0)
+        sl_pips = max(sl_min, min(sl_pips, sl_max))
+        tp_pips = max(sl_pips * 1.5, min(tp_pips, sl_pips * 5.0))
+
+        # قوة الإشارة
+        if confidence >= 0.75:   strength = "VERY_STRONG"
+        elif confidence >= 0.65: strength = "STRONG"
+        elif confidence >= 0.55: strength = "MODERATE"
+        else:                    strength = "WEAK"
+
+        resp = {
+            "sl_pips"       : round(sl_pips, 1),
+            "tp_pips"       : round(tp_pips, 1),
+            "confidence"    : round(confidence, 4),
+            "direction"     : direction_map[pred_class],
+            "signal_strength": strength,
+            "asset_class"   : asset_key,
+            "model_used"    : cfg.get('name', asset_key),
+            "proba_buy"     : round(float(proba[2]), 4),
+            "proba_sell"    : round(float(proba[0]), 4),
+            "proba_neutral" : round(float(proba[1]), 4),
+        }
+
+        logger.info(f"📤 {direction_map[pred_class]} | conf={confidence:.2f} | SL={sl_pips:.0f} | TP={tp_pips:.0f} | [{asset_key}]")
+        return jsonify(resp)
 
     except Exception as e:
-        logger.error(f"Prediction error: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+        logger.error(f"❌ خطأ: {e}")
+        return jsonify({"error": str(e)}), 500
 
 
-@app.post("/predict/batch", response_model=BatchResponse, tags=["Prediction"])
-async def predict_batch(batch: BatchRequest):
-    """تنبؤات متعددة دفعة واحدة (حتى 100 طلب)."""
-    if len(batch.items) > 100:
-        raise HTTPException(status_code=400, detail="Max 100 items per batch")
-
-    results = []
-    for item in batch.items:
-        try:
-            X = build_features(item)
-            sl_raw = float(model_sl.predict(X)[0])
-            tp_raw = float(model_tp.predict(X)[0])
-            sl_pips = round(float(np.clip(sl_raw, 5.0, 150.0)), 2)
-            tp_pips = round(float(np.clip(tp_raw, 10.0, 300.0)), 2)
-            if tp_pips <= sl_pips:
-                tp_pips = round(sl_pips * 1.5, 2)
-            rr_ratio   = round(tp_pips / sl_pips, 3)
-            confidence = compute_confidence(sl_pips, tp_pips, item.adx, item.rsi)
-            direction_str = "BUY" if item.direction > 0 else "SELL"
-            results.append(PredictResponse(
-                sl_pips=sl_pips,
-                tp_pips=tp_pips,
-                confidence=confidence,
-                rr_ratio=rr_ratio,
-                message=f"{direction_str}: SL={sl_pips}p TP={tp_pips}p RR={rr_ratio:.2f}",
-            ))
-        except Exception as e:
-            results.append(PredictResponse(
-                sl_pips=0, tp_pips=0, confidence=0, rr_ratio=0,
-                message=f"ERROR: {str(e)}"
-            ))
-
-    return BatchResponse(results=results, count=len(results))
+# ================================================================
+#  نقطة فحص الصحة: /health
+# ================================================================
+@app.route('/health', methods=['GET'])
+def health():
+    return jsonify({
+        "status" : "ready" if MODELS else "no_models",
+        "models" : {k: v.get('config',{}).get('name','?') for k, v in MODELS.items()},
+        "version": "3.0",
+    })
 
 
-# ─────────────────────────────────────────────
-# نقطة الدخول
-# ─────────────────────────────────────────────
-if __name__ == "__main__":
-    import uvicorn
-    port = int(os.environ.get("PORT", 8000))
-    uvicorn.run("app:app", host="0.0.0.0", port=port, reload=False)
+# ================================================================
+#  قائمة النماذج: /models
+# ================================================================
+@app.route('/models', methods=['GET'])
+def list_models():
+    info = {}
+    for k, v in MODELS.items():
+        cfg = v.get('config', {})
+        info[k] = {
+            "name"       : cfg.get('name', k),
+            "description": cfg.get('description', ''),
+            "features"   : len(v.get('feature_columns', [])),
+            "adx_thresh" : cfg.get('adx_threshold', '?'),
+        }
+    return jsonify(info)
+
+
+# ================================================================
+#  اختبار اكتشاف الزوج: /detect?symbol=BTCUSD
+# ================================================================
+@app.route('/detect', methods=['GET'])
+def detect():
+    symbol = request.args.get('symbol', 'EURUSD')
+    asset  = detect_asset_class(symbol)
+    return jsonify({"symbol": symbol, "detected_class": asset,
+                    "model_available": asset in MODELS})
+
+
+if __name__ == '__main__':
+    port = int(os.environ.get("PORT", 5000))
+    logger.info(f"🚀 ARIA Adaptive Server v3.0 — منفذ {port}")
+    app.run(host='0.0.0.0', port=port, debug=False)
+
