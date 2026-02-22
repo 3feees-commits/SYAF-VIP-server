@@ -5,4 +5,5 @@ pydantic-core==2.27.1
 xgboost
 pandas
 numpy
+scikit-learn
 gunicorn
