@@ -1,9 +1,12 @@
+flask==3.0.0
+xgboost==2.0.3
+scikit-learn==1.4.0
+pandas==2.1.4
+numpy==1.26.3
+joblib==1.3.2
+gunicorn==21.2.0
+requests==2.31.0
 fastapi==0.115.6
 uvicorn==0.34.0
 pydantic==2.10.3
 pydantic-core==2.27.1
-xgboost
-pandas
-numpy
-scikit-learn
-gunicorn
