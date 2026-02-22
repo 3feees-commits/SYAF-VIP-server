@@ -293,12 +293,33 @@ def train_one(df, cfg, asset_key):
 #  التشغيل الرئيسي
 # ================================================================
 def load_csv(path):
-    df = pd.read_csv(path, parse_dates=['time'])
+    # 1. قراءة الملف بشكل طبيعي
+    df = pd.read_csv(path)
+    
+    # 2. تنظيف أسماء الأعمدة (تحويل لحروف صغيرة وإزالة أقواس الميتاتريدر < >)
+    df.columns = df.columns.str.lower().str.replace('<', '').str.replace('>', '')
+    
+    # 3. معالجة التاريخ والوقت بذكاء
+    if 'date' in df.columns and 'time' in df.columns:
+        # دمج عمود التاريخ مع عمود الوقت (صيغة الميتاتريدر المعتادة)
+        df['time'] = pd.to_datetime(df['date'].astype(str) + ' ' + df['time'].astype(str))
+        df.drop(columns=['date'], inplace=True)
+    elif 'date' in df.columns and 'time' not in df.columns:
+        # إذا كان هناك عمود تاريخ فقط
+        df.rename(columns={'date': 'time'}, inplace=True)
+        df['time'] = pd.to_datetime(df['time'])
+    else:
+        # إذا كان العمود اسمه time وجاهزاً
+        df['time'] = pd.to_datetime(df['time'])
+
+    # 4. الترتيب وإعادة الضبط (هذا الجزء الذي كان ناقصاً)
     df.sort_values('time', inplace=True)
     df.reset_index(drop=True, inplace=True)
     print(f"  ✅ {path}: {len(df):,} شمعة")
+    
+    # 5. إرجاع البيانات للكود الرئيسي (الأهم!)
     return df
-
+   
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description='ARIA Multi-Asset XGBoost Trainer v3.0')
     parser.add_argument('--btc',   nargs='+', help='ملفات CSV للكريبتو (BTC, ETH)')
