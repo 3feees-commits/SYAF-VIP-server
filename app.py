@@ -296,3 +296,7 @@ if __name__ == '__main__':
     logger.info(f"🚀 ARIA Adaptive Server v3.0 — منفذ {port}")
     app.run(host='0.0.0.0', port=port, debug=False)
 
+# ================================================================
+#  WSGI entry point للـ gunicorn
+#  Start Command: gunicorn app:app --workers 1 --timeout 120
+# ================================================================
