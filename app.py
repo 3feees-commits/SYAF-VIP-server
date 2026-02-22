@@ -71,8 +71,8 @@ async def lifespan(app: FastAPI):
     meta_path = os.path.join(MODELS_DIR, "model_meta.json")
 
     if not os.path.exists(sl_path) or not os.path.exists(tp_path):
-        logger.error("النماذج غير موجودة! شغّل scripts/train_model.py أولاً.")
-        raise RuntimeError("Models not found. Run scripts/train_model.py first.")
+        logger.error("النماذج غير موجودة! شغّل train_model.py أولاً.")
+        raise RuntimeError("Models not found. Run train_model.py first.")
 
     model_sl = xgb.XGBRegressor()
     model_sl.load_model(sl_path)
@@ -387,4 +387,4 @@ async def predict_batch(batch: BatchRequest):
 if __name__ == "__main__":
     import uvicorn
     port = int(os.environ.get("PORT", 8000))
-    uvicorn.run("main:app", host="0.0.0.0", port=port, reload=False)
+    uvicorn.run("app:app", host="0.0.0.0", port=port, reload=False)
