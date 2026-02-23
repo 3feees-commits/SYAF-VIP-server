@@ -1,0 +1,7 @@
+services:
+  - type: web
+    name: aria-xgboost-server
+    env: python
+    buildCommand: "pip install -r requirements.txt && python create_dummy_models.py"
+    startCommand: "gunicorn app:app --workers 1 --timeout 120 --bind 0.0.0.0:$PORT"
+    plan: free

@@ -1,0 +1,29 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Models (اختياري — احذف هذا السطر إذا أردت رفع النماذج)
+# models/*.pkl
+
+# Data files (لا ترفع ملفات CSV الكبيرة)
+*.csv
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
