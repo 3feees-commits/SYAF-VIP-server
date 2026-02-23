@@ -293,12 +293,48 @@ def train_one(df, cfg, asset_key):
 #  التشغيل الرئيسي
 # ================================================================
 def load_csv(path):
-    df = pd.read_csv(path, parse_dates=['time'])
-    df.sort_values('time', inplace=True)
-    df.reset_index(drop=True, inplace=True)
-    print(f"  ✅ {path}: {len(df):,} شمعة")
-    return df
+    # الميتاتريدر عادة يصدر البيانات بدون أسماء أعمدة واضحة أو بأسماء مختلفة
+    # لذلك سنجبر البايثون على تسمية الأعمدة بنفسه وتجاهل أي سطر أول
+    column_names = ['date', 'time', 'open', 'high', 'low', 'close', 'tickvol', 'vol', 'spread']
+    
+    try:
+        # محاولة القراءة مع افتراض أن العناوين موجودة
+        df = pd.read_csv(path)
+        
+        # تنظيف أسماء الأعمدة وتوحيدها (تحويلها لحروف صغيرة وإزالة المسافات)
+        df.columns = df.columns.str.lower().str.strip().str.replace('<', '').str.replace('>', '')
+        
+        # إذا لم يجد عمود 'time' ولكن وجد عمود 'date' و 'time' مفصولين (كما في MT4)
+        if 'time' not in df.columns and 'date' in df.columns and len(df.columns) > 2:
+            # دمج عمودي التاريخ والوقت في عمود واحد اسمه time
+            df['time'] = pd.to_datetime(df['date'] + ' ' + df.iloc[:, 1].astype(str))
+            df.set_index('time', inplace=True)
+            df.drop(columns=['date', df.columns[1]], inplace=True)
+            
+        elif 'time' in df.columns:
+             df['time'] = pd.to_datetime(df['time'])
+             df.set_index('time', inplace=True)
+        else:
+             # إذا فشل كل شيء، نقرأ الملف ونجبره على الأسماء الجديدة (يناسب MT5)
+             df = pd.read_csv(path, names=column_names, skiprows=1)
+             df['time'] = pd.to_datetime(df['date'] + ' ' + df['time'])
+             df.set_index('time', inplace=True)
+             df.drop(columns=['date'], inplace=True)
 
+    except Exception as e:
+        print(f"Error parsing CSV {path}: {e}")
+        # قراءة اضطرارية مباشرة
+        df = pd.read_csv(path, names=column_names, skiprows=1)
+        df['time'] = pd.to_datetime(df['date'] + ' ' + df['time'])
+        df.set_index('time', inplace=True)
+        df.drop(columns=['date'], inplace=True)
+
+    # تحويل كل الأعمدة المتبقية إلى أرقام
+    for col in df.columns:
+        df[col] = pd.to_numeric(df[col], errors='coerce')
+        
+    df.dropna(inplace=True)
+    return df
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description='ARIA Multi-Asset XGBoost Trainer v3.0')
     parser.add_argument('--btc',   nargs='+', help='ملفات CSV للكريبتو (BTC, ETH)')
